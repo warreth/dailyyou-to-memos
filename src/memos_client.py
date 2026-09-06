@@ -80,6 +80,24 @@ class MemosClient:
             payload["attachments"] = attachments
         return self._post_json("/memos", payload)
 
+    def delete_memo(self, name: str) -> None:
+        """DELETE /api/v1/memos/{id}. 404 counts as done (already deleted)."""
+        self._delete(name)
+
+    def delete_attachment(self, name: str) -> None:
+        """DELETE /api/v1/attachments/{id}. 404 counts as done."""
+        self._delete(name)
+
+    def _delete(self, resource_name: str) -> None:
+        # resource_name is "memos/123" or "attachments/456"; the route is
+        # DELETE /api/v1/{name=...} so it maps directly onto the path suffix.
+        url = f"{self.settings.api_v1}/{resource_name}"
+        resp = self._request("DELETE", url)
+        if resp.status_code == 404:
+            return  # already gone: the rollback goal is met
+        if not resp.ok:
+            raise MemosApiError(f"DELETE {url} -> {resp.status_code}: {resp.text[:300]}")
+
     def close(self) -> None:
         self._session.close()
 

@@ -11,6 +11,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import Entry, MemosApiSettings, MigrationOptions  # noqa: E402
 from src.extractor import extract_backup, find_backups  # noqa: E402
+from src.ledger import (  # noqa: E402
+    MigrationLedger,
+    clear_ledger,
+    load_ledger,
+    save_ledger,
+)
 from src.memos_client import MemosApiError, MemosClient  # noqa: E402
 from src.parser import parse_backup  # noqa: E402
 
@@ -124,6 +130,8 @@ def run_migration(
     api: MemosApiSettings,
     options: MigrationOptions,
 ) -> None:
+    # Fresh ledger per run: rollback targets exactly this run's creations.
+    ledger = MigrationLedger(base_url=api.base_url.rstrip("/"))
     with MemosClient(api) as client:
         progress = st.progress(0.0, text="Starting migration...")
         status = st.empty()
@@ -135,11 +143,18 @@ def run_migration(
                 for img in entry.images:
                     att = client.upload_attachment(img.path)
                     attachments.append(att)
-                client.create_memo(
+                memo = client.create_memo(
                     content=entry.render_content(options),
                     create_time=entry.created_at.isoformat(),
                     attachments=attachments,
                 )
+                # Record immediately so a crash mid-run still leaves a
+                # complete rollback record of everything already created.
+                ledger.add(
+                    name=memo["name"],
+                    attachment_names=[a["name"] for a in attachments],
+                )
+                save_ledger(PRIVATE_DIR, ledger)
                 ok += 1
                 status.write(f"{label} migrated")
             except MemosApiError as exc:
@@ -155,11 +170,106 @@ def run_migration(
             st.success(f"Migration complete: {ok}/{len(entries)} entries")
 
 
+def rollback_panel(api: MemosApiSettings) -> None:
+    """Delete exactly what the ledger records. Nothing else, ever.
+
+    Safety rails:
+    - No search or listing is used; only ledger identifiers are deleted.
+    - The configured instance must match the instance the ledger recorded.
+    - A typed confirmation phrase is required before the button activates.
+    - 404s during deletion count as success (already deleted).
+    """
+    st.subheader("Rollback")
+    ledger = load_ledger(PRIVATE_DIR)
+
+    if ledger is None:
+        st.info("No migration ledger found. Nothing to roll back.")
+        return
+    if ledger.is_empty():
+        st.info("Ledger is empty. Nothing to roll back.")
+        return
+
+    memo_count, att_count = ledger.counts()
+    if ledger.base_url.rstrip("/") != api.base_url.rstrip("/"):
+        st.error(
+            f"This ledger was recorded against a different instance "
+            f"({ledger.base_url}). Rollback refused to protect that instance."
+        )
+        return
+
+    st.warning(
+        f"The ledger records {memo_count} memo(s) and {att_count} "
+        f"attachment(s) created by the last migration run on "
+        f"{ledger.base_url}. Deleting these removes them permanently."
+    )
+    with st.expander("Ledger contents", expanded=False):
+        st.json(
+            [
+                {"memo": m.name, "attachments": m.attachment_names}
+                for m in ledger.memos
+            ]
+        )
+
+    confirm = st.text_input(
+        "Type ROLLBACK to enable the delete button",
+        key="rollback_confirm",
+    )
+    if st.button(
+        "Delete migrated journals from Memos",
+        type="primary",
+        disabled=(confirm != "ROLLBACK" or not api.token),
+    ):
+        with MemosClient(api) as client:
+            progress = st.progress(0.0, text="Rolling back...")
+            status = st.empty()
+            failures = []
+            total = memo_count + att_count
+            done = 0
+
+            def bump(msg: str) -> None:
+                nonlocal done
+                done += 1
+                progress.progress(done / total)
+                status.write(msg)
+
+            # Delete memos first: the server cascades their owned
+            # attachments, so the explicit attachment deletes below
+            # usually hit 404, which is the desired end state.
+            for memo in ledger.memos:
+                try:
+                    client.delete_memo(memo.name)
+                    bump(f"Deleted {memo.name}")
+                except MemosApiError as exc:
+                    failures.append((memo.name, str(exc)))
+                # Defensive sweep: if the server did not cascade, remove
+                # the attachment records explicitly (404 = already gone).
+                for att in memo.attachment_names:
+                    try:
+                        client.delete_attachment(att)
+                        bump(f"Deleted {att}")
+                    except MemosApiError as exc:
+                        failures.append((att, str(exc)))
+
+            if failures:
+                st.error(f"Rollback finished with {len(failures)} failures")
+                with st.expander("Failures"):
+                    for name, msg in failures:
+                        st.write(f"{name}: {msg}")
+            else:
+                st.success(
+                    f"Rollback complete: {memo_count} memo(s) and "
+                    f"{att_count} attachment record(s) removed"
+                )
+                clear_ledger(PRIVATE_DIR)
+
+
 def main() -> None:
     st.title("Daily You → Memos Migration")
     api, options = sidebar_settings()
     parse_panel()
     entries = tags_panel(options)
+
+    st.divider()
 
     if entries:
         st.subheader("Preview (first entry)")
@@ -170,6 +280,8 @@ def main() -> None:
                 st.error("Token required")
                 return
             run_migration(entries, api, options)
+
+    rollback_panel(api)
 
 
 if __name__ == "__main__":
