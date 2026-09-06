@@ -94,7 +94,7 @@ def tags_panel(options: MigrationOptions) -> list[Entry]:
             "date": e.created_at.strftime("%Y-%m-%d %H:%M"),
             "mood": e.mood_emoji or "",
             "images": len(e.images),
-            "text": e.text[:80],
+            "text": e.text[:200],
             "custom_tags": ", ".join(e.custom_tags),
         }
         for e in entries
@@ -113,12 +113,42 @@ def tags_panel(options: MigrationOptions) -> list[Entry]:
         },
         height=420,
     )
-    # Sync edited custom tags back onto Entry objects.
-    for row in edited.itertuples():
-        entry = entries[row.Index]
-        new_tags = [t.strip() for t in (row.custom_tags or "").split(",") if t.strip()]
-        entry.custom_tags = new_tags
+    # st.data_editor returns the same shape it received: a list of dicts.
+    sync_custom_tags(entries, edited)
     return entries
+
+
+def sync_custom_tags(entries: list[Entry], edited_rows: list[dict]) -> None:
+    """Apply data_editor edits back onto Entry objects, matched by entry id.
+
+    Id-matching (not list position) keeps edits correct even if the user
+    reorders or sorts the table in the editor.
+    """
+    edited_by_id = {
+        int(row["id"]): (row.get("custom_tags") or "") for row in edited_rows
+    }
+    for entry in entries:
+        if entry.id not in edited_by_id:
+            continue  # row absent from editor output: nothing was edited
+        raw = edited_by_id[entry.id]
+        entry.custom_tags = [t.strip() for t in raw.split(",") if t.strip()]
+
+
+def full_text_panel(entries: list[Entry]) -> None:
+    """Inspect the complete parsed text of any entry.
+
+    The table column is a 200-char preview by design; this panel proves
+    the full text is parsed and what will actually be migrated.
+    """
+    with st.expander("Inspect full entry text", expanded=False):
+        labels = [
+            f"#{e.id} {e.created_at.strftime('%Y-%m-%d')} ({len(e.text)} chars, {len(e.images)} imgs)"
+            for e in entries
+        ]
+        chosen = st.selectbox("Entry", labels)
+        entry = entries[labels.index(chosen)]
+        st.markdown(entry.text)
+        st.caption(f"Full length: {len(entry.text)} characters")
 
 
 def render_preview(entry: Entry, options: MigrationOptions) -> str:
@@ -272,6 +302,7 @@ def main() -> None:
     st.divider()
 
     if entries:
+        full_text_panel(entries)
         st.subheader("Preview (first entry)")
         st.code(render_preview(entries[0], options))
 
