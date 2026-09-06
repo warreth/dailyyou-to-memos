@@ -10,7 +10,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import Entry, MemosApiSettings, MigrationOptions  # noqa: E402
-from src.extractor import extract_backup, find_backups  # noqa: E402
+from src.extractor import extract_backup_kept, find_backups  # noqa: E402
 from src.ledger import (  # noqa: E402
     MigrationLedger,
     clear_ledger,
@@ -25,6 +25,7 @@ STATE_ENTRIES = "entries"
 STATE_WARNINGS = "parse_warnings"
 STATE_TAGS_KEY = "tags_editor"
 STATE_BACKUP_NAME = "backup_name"
+STATE_TMP = "extracted_tmp"
 
 
 st.set_page_config(page_title="Daily You -> Memos", page_icon="\U0001F4D6", layout="wide")
@@ -70,11 +71,17 @@ def parse_panel() -> None:
     if st.button("Parse backup", type="primary"):
         with st.spinner(f"Extracting {selected}..."):
             try:
-                with extract_backup(zip_path) as backup:
-                    entries, warnings = parse_backup(backup.db_path, backup.images_dir)
+                backup, tmp_dir = extract_backup_kept(zip_path)
+                entries, warnings = parse_backup(backup.db_path, backup.images_dir)
             except (FileNotFoundError, ValueError) as exc:
                 st.error(f"Extraction/parse failed: {exc}")
                 return
+        # Keep the extracted files alive: Entry objects reference them
+        # by path until migration runs. Free the previous extraction first.
+        old_tmp = st.session_state.get(STATE_TMP)
+        if old_tmp is not None:
+            old_tmp.cleanup()
+        st.session_state[STATE_TMP] = tmp_dir
         st.session_state[STATE_ENTRIES] = entries
         st.session_state[STATE_WARNINGS] = warnings
         st.session_state.pop(STATE_TAGS_KEY, None)
@@ -187,7 +194,9 @@ def run_migration(
                 save_ledger(PRIVATE_DIR, ledger)
                 ok += 1
                 status.write(f"{label} migrated")
-            except MemosApiError as exc:
+            except (MemosApiError, OSError) as exc:
+                # OSError covers missing/unreadable image files on disk;
+                # record the entry as failed but keep migrating the rest.
                 failed.append((entry.id, str(exc)))
                 status.write(f"{label} FAILED: {exc}")
             progress.progress((i + 1) / len(entries))

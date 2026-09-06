@@ -34,28 +34,38 @@ def _safe_extract(zip_path: Path, target: Path) -> None:
         zf.extractall(target)
 
 
+def _locate_backup(root: Path, zip_name: str) -> ExtractedBackup:
+    """Find db and Images/ inside an already-extracted root dir."""
+    candidates = list(root.rglob("daily_you.db"))
+    if not candidates:
+        raise FileNotFoundError(f"No daily_you.db found inside {zip_name}")
+    images_dirs = [d for d in root.rglob("Images") if d.is_dir()]
+    if not images_dirs:
+        raise FileNotFoundError(f"No Images/ directory found inside {zip_name}")
+    return ExtractedBackup(db_path=candidates[0], images_dir=images_dirs[0])
+
+
+def extract_backup_kept(zip_path: Path) -> tuple[ExtractedBackup, tempfile.TemporaryDirectory]:
+    """Extract into a temp dir that STAYS ALIVE until the caller cleans it up.
+
+    Use this when parsed entries keep referencing image files after the
+    function returns (e.g. stored in streamlit session_state). The caller
+    owns the returned TemporaryDirectory and must call .cleanup() when done;
+    it is also released automatically when garbage collected.
+    """
+    tmp = tempfile.TemporaryDirectory(prefix="dailyyou_")
+    root = Path(tmp.name)
+    _safe_extract(zip_path, root)
+    return _locate_backup(root, zip_path.name), tmp
+
+
 @contextmanager
 def extract_backup(zip_path: Path) -> Iterator[ExtractedBackup]:
     """Yield an ExtractedBackup inside a self-cleaning TemporaryDirectory.
 
-    Raises FileNotFoundError if the zip has no daily_you.db or Images/ dir.
+    Only for short-lived use: everything is deleted when the block exits.
     """
     with tempfile.TemporaryDirectory(prefix="dailyyou_") as tmp:
         root = Path(tmp)
         _safe_extract(zip_path, root)
-
-        candidates = list(root.rglob("daily_you.db"))
-        if not candidates:
-            raise FileNotFoundError(
-                f"No daily_you.db found inside {zip_path.name}"
-            )
-        db_path = candidates[0]
-
-        images_dirs = [d for d in root.rglob("Images") if d.is_dir()]
-        if not images_dirs:
-            raise FileNotFoundError(
-                f"No Images/ directory found inside {zip_path.name}"
-            )
-        images_dir = images_dirs[0]
-
-        yield ExtractedBackup(db_path=db_path, images_dir=images_dir)
+        yield _locate_backup(root, zip_path.name)
